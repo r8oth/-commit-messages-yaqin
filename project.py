@@ -20,12 +20,26 @@ chat_id = "784582542"
 def send_telegram(message):
     if not use_telegram:
         return
+
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    data = {"chat_id": chat_id, "text": message}
+    data = {
+        "chat_id": chat_id,
+        "text": message
+    }
+
     try:
-        requests.post(url, data=data)
+        response = requests.post(url, data=data, timeout=10)
+
+        if response.status_code != 200:
+            print("❌ Telegram HTTP Error:", response.status_code)
+            print(response.text)
+        else:
+            result = response.json()
+            if not result.get("ok"):
+                print("❌ Telegram API Error:", result)
+
     except Exception as e:
-        print("❌ Telegram send error:", e)
+        print("❌ Telegram exception:", e)
 
 
 def get_git_diff():
@@ -49,14 +63,17 @@ def analyze_diff(diff):
 
     for line in diff.splitlines():
 
-        # Detect file
         if line.startswith("diff --git"):
             parts = line.split()
             if len(parts) >= 3:
                 current_file = parts[2][2:]
+
+                if current_file == "commit_log.txt":
+                    current_file = None
+                    continue
+
                 files_changes[current_file] = []
 
-        # Detect hunk
         hunk = hunk_pattern.match(line)
         if hunk:
             old_line = int(hunk.group(1))
@@ -66,22 +83,26 @@ def analyze_diff(diff):
         if current_file is None:
             continue
 
-        # Removed line
         if line.startswith("-") and not line.startswith("---"):
             files_changes[current_file].append({
-                "type": "remove",
-                "line": old_line,
-                "content": line[1:]
+                "type": "change",
+                "old_line": old_line,
+                "old_content": line[1:].strip(),
+                "new_content": None
             })
             old_line += 1
 
-        # Added line
         elif line.startswith("+") and not line.startswith("+++"):
-            files_changes[current_file].append({
-                "type": "add",
-                "line": new_line,
-                "content": line[1:]
-            })
+            if files_changes[current_file] and files_changes[current_file][-1]["new_content"] is None:
+                files_changes[current_file][-1]["new_content"] = line[1:].strip()
+                files_changes[current_file][-1]["new_line"] = new_line
+            else:
+                files_changes[current_file].append({
+                    "type": "add",
+                    "new_line": new_line,
+                    "new_content": line[1:].strip()
+                })
+
             new_line += 1
 
         else:
@@ -91,82 +112,76 @@ def analyze_diff(diff):
     return files_changes
 
 
-def generate_commit_message(changes):
+def build_detailed_message(changes):
     messages = []
 
-    for file, actions in changes.items():
-        for action in actions:
-            if action["type"] == "add":
-                messages.append(f"Add in {file} (line {action['line']})")
-            elif action["type"] == "remove":
-                messages.append(f"Remove in {file} (line {action['line']})")
+    for file, change_list in changes.items():
+        for change in change_list:
 
-    if not messages:
-        messages.append("Update code")
+            if change.get("type") == "change" and change.get("new_content"):
+                messages.append(
+                    f"✏️ {file}\n"
+                    f"Line {change['old_line']} قبل:\n{change['old_content']}\n"
+                    f"Line {change.get('new_line','?')} بعد:\n{change['new_content']}"
+                )
 
-    # remove duplicates
-    messages = list(dict.fromkeys(messages))
-    return " | ".join(messages)
+            elif change.get("type") == "add":
+                messages.append(
+                    f"➕ {file} | Line {change['new_line']} إضافة:\n{change['new_content']}"
+                )
 
-
-def git_add_and_commit(commit_message):
-    subprocess.run(["git", "add", "."])
-    subprocess.run(["git", "commit", "-m", commit_message])
+    return "\n\n".join(messages[:20])
 
 
-def save_log(commit_message, changes):
+def git_add_and_commit(message):
+    subprocess.run(["git", "add", "."], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    subprocess.run(
+        ["git", "commit", "-m", message],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+
+def save_log(message):
     with open(log_file, "a", encoding="utf-8") as f:
-        f.write(f"\n==== Commit at {datetime.now()} ====\n")
-        f.write(f"Commit message: {commit_message}\n")
+        f.write(f"{datetime.now()} - {message}\n")
+        
+        # ===== المراقبة =====
 
-        for file, actions in changes.items():
-            f.write(f"\n📄 File: {file}\n")
-            for action in actions:
-                if action["type"] == "add":
-                    f.write(f"  [+] Line {action['line']}: {action['content']}\n")
-                elif action["type"] == "remove":
-                    f.write(f"  [-] Line {action['line']}: {action['content']}\n")
+print("🚀 Auto-commit running...")
 
-        f.write("\n")
-
-
-# ===== المراقبة المستمرة =====
-print("🚀 Auto-commit monitor started... Press Ctrl+C to stop.")
-
-last_diff_snapshot = None
-last_sent_commit_message = ""
+last_diff = ""
 
 while True:
     try:
-        diff_text = get_git_diff()
+        diff = get_git_diff()
 
-        if diff_text and diff_text != last_diff_snapshot:
-            last_diff_snapshot = diff_text
+        if not diff or diff == last_diff:
+            time.sleep(3)
+            continue
 
-            changes = analyze_diff(diff_text)
+        last_diff = diff
 
-            if changes:
-                commit_message = generate_commit_message(changes)
-                if commit_message != last_sent_commit_message:
-                    send_telegram(f"🔹 New commit created:\n{commit_message}")
-                    last_sent_commit_message = commit_message
+        changes = analyze_diff(diff)
 
-                    git_add_and_commit(commit_message)
-                    save_log(commit_message, changes)
+        if changes:
+            message = build_detailed_message(changes)
 
-                print("\n🔹 Suggested commit message:\n")
-                print(commit_message)
-                print("\n✅ Commit has been created automatically")
-                print(f"📚 All commit details saved to {log_file}")
+            git_add_and_commit("Auto commit")
+            save_log(message)
 
-        time.sleep(5)
+            send_telegram(f"🔔 Changes detected:\n\n{message}")
+
+            print("✅ Commit sent")
+
+        time.sleep(2)
 
     except KeyboardInterrupt:
-        print("\n🛑 Auto-commit monitor stopped by user.")
+        print("🛑 Stopped")
         break
 
     except Exception as e:
         print("❌ Error:", e)
-        time.sleep(5)
-        print ("thank you ")
-        
+        time.sleep(2)
+print("اتمنا عجبكم المشروع وشكراالطالبة يقين نوري زامل 😁")
